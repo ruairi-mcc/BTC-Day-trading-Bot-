@@ -246,6 +246,9 @@ def run_daytrader():
             latest = df.iloc[-1]
             prev = df.iloc[-2]
 
+             # Log indicator values
+            logging.info(f"Indicators: EMA_short={latest['EMA_short']:.2f}, EMA_long={latest['EMA_long']:.2f}, RSI={latest['RSI']:.2f}, ATR={latest['ATR']:.2f}")
+
             # Signal logic: EMA crossover + RSI filter
             signal = None
             if (prev['EMA_short'] < prev['EMA_long']) and (latest['EMA_short'] > latest['EMA_long']) and (latest['RSI'] < 70):
