@@ -10,15 +10,15 @@ import requests
 # Alpaca imports
 from alpaca.data import CryptoHistoricalDataClient
 from alpaca.data.requests import CryptoBarsRequest
-from alpaca.data.timeframe import TimeFrame
+from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
 from alpaca.trading.client import TradingClient
 from alpaca.trading.requests import OrderRequest, TakeProfitRequest, StopLossRequest
 from alpaca.trading.enums import OrderSide, OrderType, AssetClass
 
 # ─── CONFIGURATION ──────────────────────────────────────────────
 load_dotenv()
-API_KEY    = os.getenv("APCA_API_KEY_ID")
-API_SECRET = os.getenv("APCA_API_SECRET_KEY")
+API_KEY    = "PKTZNXVE54MF1WERXH7O"
+API_SECRET = "mXX6EyyqOfACLPwlNDniOuCUX2hG2vCtcZpVNDx3"
 PAPER_MODE = True
 
 REQUEST_SYMBOL = "BTC/USD"
@@ -29,11 +29,13 @@ ATR_PERIOD    = 14
 TRADE_RISK    = 0.01  # 1% of cash per trade
 FEE_RATE      = 0.0005
 INITIAL_CASH  = 100000.0
-MAX_DAILY_LOSS = 500
+MAX_DAILY_LOSS = 1000
 MAX_TRADES_PER_DAY = 10
 TRADING_START = dtime(8, 0)   # 8:00 UTC
-TRADING_END   = dtime(18, 0)  # 18:00 UTC
+TRADING_END   = dtime(23, 0)  # 18:00 UTC
 SLEEP_SECONDS = 60
+MAX_ALLOC_PCT = 0.10  # 10% of cash per trade
+
 
 # Telegram
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -179,17 +181,18 @@ def submit_bracket_order(trading_client, symbol, qty, side, take_profit_pct=0.01
         resp = trading_client.submit_order(order)
         logging.info(f"Bracket order submitted: {side.name} {qty} {symbol} @ {price:.2f}")
         send_telegram_alert(f"Bracket order: {side.name} {qty} {symbol} @ {price:.2f}")
-        return resp
+        return True
     except Exception as e:
         logging.error(f"Bracket order failed: {e}")
         send_telegram_alert(f"Bracket order failed: {e}")
+        return False
 
 def get_latest_price(symbol):
-    # Fetch the latest close price (1 bar)
+    # Fetch the latest close price (1 bar 30 mins)
     now_utc = datetime.utcnow()
     end_dt = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-    start_dt = (now_utc - timedelta(minutes=5)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    df = fetch_crypto_bars(symbol, start=start_dt, end=end_dt, timeframe=TimeFrame.Minute)
+    start_dt = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    df = fetch_crypto_bars(symbol, start=start_dt, end=end_dt, timeframe=TimeFrame(30, TimeFrameUnit.Minute))
     if not df.empty:
         return df['Close'].iloc[-1]
     else:
@@ -235,8 +238,8 @@ def run_daytrader():
 
             now_utc = datetime.utcnow()
             end_dt = now_utc.strftime("%Y-%m-%dT%H:%M:%SZ")
-            start_dt = (now_utc - timedelta(hours=2)).strftime("%Y-%m-%dT%H:%M:%SZ")
-            df = fetch_crypto_bars(REQUEST_SYMBOL, start=start_dt, end=end_dt, timeframe=TimeFrame.Minute)
+            start_dt = (now_utc - timedelta(days=30)).strftime("%Y-%m-%dT%H:%M:%SZ")  # 30 days of 30-min bars
+            df = fetch_crypto_bars(REQUEST_SYMBOL, start=start_dt, end=end_dt, timeframe=TimeFrame(30, TimeFrameUnit.Minute))  # 30-min bars
             if df.empty or len(df) < LONG_EMA + 2:
                 logging.warning("Not enough data to compute indicators. Skipping this cycle.")
                 time.sleep(SLEEP_SECONDS)
@@ -245,7 +248,7 @@ def run_daytrader():
             df = add_indicators(df)
             latest = df.iloc[-1]
             prev = df.iloc[-2]
-
+            
              # Log indicator values
             logging.info(f"Indicators: EMA_short={latest['EMA_short']:.2f}, EMA_long={latest['EMA_long']:.2f}, RSI={latest['RSI']:.2f}, ATR={latest['ATR']:.2f}")
 
@@ -266,10 +269,48 @@ def run_daytrader():
                 currently_long = False
 
             # Execute trade
+  
             if signal == "BUY" and not currently_long:
+                MAX_NOTIONAL = 200000
+                NOTIONAL_BUFFER = 0.97  # 97% of max to avoid all issues
+                CASH_BUFFER = 0.97      # 97% of cash to be safe
+
                 cash = float(account.cash)
                 atr = latest['ATR']
-                qty = get_position_size(cash, atr)
+                price = float(latest['Close'])
+                safe_price = price * 1.01  # Assume price could move up 1% before fill
+
+                # ATR-based position sizing
+                qty_atr = get_position_size(cash, atr)
+                # Notional cap
+                qty_notional = round((MAX_NOTIONAL * NOTIONAL_BUFFER) / safe_price, 6)
+                # Cash cap
+                qty_cash = round((cash * CASH_BUFFER) / safe_price, 6)
+                # Use the smallest qty
+                qty = min(qty_atr, qty_notional, qty_cash)
+                # Max allocation cap
+                qty_max_alloc = round((cash * MAX_ALLOC_PCT) / safe_price, 6)
+                qty = min(qty, qty_max_alloc)
+                logging.info(f"Max allocation cap: qty_max_alloc={qty_max_alloc}, applied final_qty={qty}")
+                notional = qty * safe_price
+
+                # Final check
+                if notional > cash * CASH_BUFFER:
+                    qty = round((cash * CASH_BUFFER) / safe_price, 6)
+                    notional = qty * safe_price
+                    logging.info(f"Final adjustment: qty set to {qty} to ensure notional {notional:.2f} < available cash {cash:.2f}")
+
+                logging.info(
+                    f"Order sizing: qty_atr={qty_atr}, qty_notional={qty_notional}, qty_cash={qty_cash}, final_qty={qty}, notional={notional:.2f}, cash={cash:.2f}"
+                )
+
+                if qty > 0:
+                    success = submit_bracket_order(trading_client, REQUEST_SYMBOL, qty, OrderSide.BUY)
+                    if success:
+                        trades_today += 1
+                else:
+                    logging.warning("Calculated qty is zero or negative. No order submitted.")
+                
                 if qty > 0:
                     submit_bracket_order(trading_client, REQUEST_SYMBOL, qty, OrderSide.BUY)
                     trades_today += 1
@@ -278,7 +319,7 @@ def run_daytrader():
                 submit_bracket_order(trading_client, REQUEST_SYMBOL, qty_to_sell, OrderSide.SELL)
                 trades_today += 1
             else:
-                logging.info(f"No trade. Signal={signal}, Currently long={currently_long}")
+                logging.info(f"No trade. Signal = {signal}, Currently long = {currently_long}")
 
             # End-of-day close
             if datetime.utcnow().time() > TRADING_END:
